@@ -212,29 +212,8 @@ def build_mesh(mesh_chunk, node_chunk, archive, collection,
     #   p = sum(link.offset * bone.transform * link.blending) for each link
     # link.offset is the vertex position in the bone's local space.
     # We precompute this if bone initial positions are available.
-    bone_matrices = {}  # bone_id → Blender Matrix4x4
-    if mc.has_bone_info and mc.physique and archive.bone_initial_pos_chunks:
-        for bone in (archive.bone_anim_chunks[0].bones if archive.bone_anim_chunks else []):
-            init = archive.get_bone_initial_pos(bone.bone_id)
-            if init:
-                bone_matrices[bone.bone_id] = cry_matrix43_to_blender(init)
-
     for vi, cv in enumerate(mc.vertices):
-        if mc.has_bone_info and vi < len(mc.physique) and bone_matrices:
-            # Recalculate position via bone transforms (like Max does)
-            bl = mc.physique[vi]
-            p = mathutils.Vector((0, 0, 0))
-            for lnk in bl.links:
-                if lnk.bone_id in bone_matrices:
-                    bm_mat = bone_matrices[lnk.bone_id]
-                    # offset is in bone local space, scaled to meters
-                    off = mathutils.Vector((lnk.offset[0] * INCHES_TO_METERS,
-                                           lnk.offset[1] * INCHES_TO_METERS,
-                                           lnk.offset[2] * INCHES_TO_METERS))
-                    p += bm_mat @ off * lnk.blending
-            bm.verts.new(p)
-        else:
-            bm.verts.new(cry_vec(cv.pos))
+        bm.verts.new(cry_vec(cv.pos))
     bm.verts.ensure_lookup_table()
 
     # Faces
@@ -334,6 +313,7 @@ def build_mesh(mesh_chunk, node_chunk, archive, collection,
 
 
 def _assign_weights(obj, mc, archive):
+    print(f"[CGF] Assigning weights: {len(mc.physique)} vertices...")
     names = {}
     if archive.bone_name_list_chunks:
         for i, n in enumerate(archive.bone_name_list_chunks[0].name_list):
@@ -345,6 +325,7 @@ def _assign_weights(obj, mc, archive):
             if bname not in obj.vertex_groups:
                 obj.vertex_groups.new(name=bname)
             obj.vertex_groups[bname].add([vid], lnk.blending, 'REPLACE')
+    print(f"[CGF] Weights done")
 
 
 def _collect_standard_chunks(mat_chunk, archive, result):
@@ -379,13 +360,28 @@ def build_armature(archive, collection):
     arm_obj  = bpy.data.objects.new("Armature", arm_data)
     collection.objects.link(arm_obj)
 
-    # Enter edit mode safely using temp_override (works in any context)
+    # Make active and enter edit mode
     bpy.context.view_layer.objects.active = arm_obj
     arm_obj.select_set(True)
 
-    with bpy.context.temp_override(active_object=arm_obj, object=arm_obj,
-                                   selected_objects=[arm_obj],
-                                   selected_editable_objects=[arm_obj]):
+    # Find window/area/region for temp_override
+    win    = bpy.context.window_manager.windows[0]
+    screen = win.screen
+    area   = next((a for a in screen.areas if a.type == 'VIEW_3D'), None)
+
+    if area is None:
+        # No 3D viewport — try any area
+        area = screen.areas[0]
+
+    region = next((r for r in area.regions if r.type == 'WINDOW'), area.regions[0])
+
+    ctx = {
+        'window': win, 'screen': screen, 'area': area, 'region': region,
+        'active_object': arm_obj, 'object': arm_obj,
+        'selected_objects': [arm_obj], 'selected_editable_objects': [arm_obj],
+    }
+
+    with bpy.context.temp_override(**ctx):
         bpy.ops.object.mode_set(mode='EDIT')
 
     eb_map = {}
@@ -416,9 +412,7 @@ def build_armature(archive, collection):
             if (child.head - parent.tail).length < 0.0001:
                 child.use_connect = True
 
-    with bpy.context.temp_override(active_object=arm_obj, object=arm_obj,
-                                   selected_objects=[arm_obj],
-                                   selected_editable_objects=[arm_obj]):
+    with bpy.context.temp_override(**ctx):
         bpy.ops.object.mode_set(mode='OBJECT')
 
     return arm_obj, arm_data
@@ -654,6 +648,7 @@ def load(operator, context, filepath,
     print(f"[CGF] Game root: '{game_root_path}'")
     reader = cgf_reader.ChunkReader()
     try:
+        print(f"[CGF] Reading file...")
         archive = reader.read_file(filepath)
     except ValueError as e:
         operator.report({'ERROR'}, str(e)); return {'CANCELLED'}
@@ -666,34 +661,43 @@ def load(operator, context, filepath,
     collection = bpy.data.collections.new(file_name)
     context.scene.collection.children.link(collection)
 
-    # Materials — collect ALL standard chunks recursively
+    # Materials
+    print(f"[CGF] Building materials...")
     blender_materials = {}
     if import_materials:
         for mc in archive.material_chunks:
             standard_chunks = []
             _collect_standard_chunks(mc, archive, standard_chunks)
+            print(f"[CGF]   material chunk: {mc.name} type={mc.type} → {len(standard_chunks)} standard")
             for std in standard_chunks:
                 if std.name not in blender_materials:
                     bmat = build_material(std, filepath, import_materials, game_root_path)
                     if bmat: blender_materials[std.name] = bmat
+    print(f"[CGF] Materials done: {len(blender_materials)}")
 
     # Armature
     arm_obj = None
     if import_skeleton and archive.bone_anim_chunks:
+        print(f"[CGF] Building armature...")
         arm_obj, _ = build_armature(archive, collection)
+        print(f"[CGF] Armature done: {arm_obj}")
 
     # Meshes
+    print(f"[CGF] Building {len(archive.mesh_chunks)} mesh(es)...")
     mesh_objects = []
-    for mc in archive.mesh_chunks:
+    for i, mc in enumerate(archive.mesh_chunks):
+        print(f"[CGF]   mesh {i}: verts={len(mc.vertices)} faces={len(mc.faces)} bone_info={mc.has_bone_info} physique={len(mc.physique)}")
         node = archive.get_node(mc.header.chunk_id)
         obj  = build_mesh(mc, node, archive, collection,
                           import_materials, import_normals, import_uvs,
                           import_weights, blender_materials, filepath)
         if obj:
             mesh_objects.append(obj)
+            print(f"[CGF]   mesh {i} done: {obj.name}")
             if archive.mesh_morph_target_chunks:
                 build_shape_keys(obj, mc, archive)
 
+    print(f"[CGF] All meshes done")
     if arm_obj and import_skeleton and import_weights:
         apply_armature_to_meshes(arm_obj, mesh_objects)
 
