@@ -154,6 +154,9 @@ def build_material(mat_chunk, filepath, import_materials, game_root_path=""):
         try:
             img = bpy.data.images.load(path, check_existing=True)
             img.colorspace_settings.name = color_space
+            # Force absolute filepath so FBX export picks up the correct path
+            img.filepath = os.path.abspath(path)
+            img.filepath_raw = os.path.abspath(path)
             node.image = img
         except Exception as e:
             print(f"[CGF] Load error {path}: {e}")
