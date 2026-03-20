@@ -1,19 +1,20 @@
 bl_info = {
-    "name": "CryEngine 1 CGF Importer (Far Cry)",
+    "name": "CryEngine 1 CGF Importer/Exporter (Far Cry)",
     "author": "Ported from Takaro CryImporter for 3ds Max",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
-    "location": "File > Import > CryEngine CGF/CAF/CAL",
-    "description": "Import CryEngine 1 / Far Cry geometry and animation files",
+    "location": "File > Import/Export > CryEngine",
+    "description": "Import/Export CryEngine 1 / Far Cry geometry and animation files",
     "category": "Import-Export",
 }
 
 import bpy
 import os
-from bpy.props import StringProperty, BoolProperty
-from bpy_extras.io_utils import ImportHelper
+from bpy.props import StringProperty, BoolProperty, EnumProperty
+from bpy_extras.io_utils import ImportHelper, ExportHelper
 from . import cgf_reader
 from . import cgf_builder
+from . import cgf_exporter
 
 
 # ── CGF / CGA geometry importer ───────────────────────────────────────────────
@@ -38,8 +39,7 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
     import_weights: BoolProperty(name="Import Vertex Weights",
         description="Assign bone weights for skinned meshes", default=False)
     game_root_path: StringProperty(name="Game Root Path",
-        description="Root folder of Far Cry installation (where Objects/, Textures/ etc. are located). "
-                    "Used to find textures by their relative path stored in materials.",
+        description="Root folder of Far Cry (where Objects/, Textures/ are). Used to find textures.",
         default="", subtype='DIR_PATH')
 
     def execute(self, context):
@@ -77,7 +77,6 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
 
 
 def _store_ctrl_ids(arm_obj):
-    """Store bone ctrl_ids as custom properties for later CAF import."""
     source_path = arm_obj.get('cgf_source_path', '')
     if not source_path:
         return
@@ -120,7 +119,7 @@ class ImportCAF(bpy.types.Operator, ImportHelper):
 # ── CAL animation list importer ───────────────────────────────────────────────
 
 class ImportCAL(bpy.types.Operator, ImportHelper):
-    """Import all animations from a CryEngine 1 CAL file (list of CAF files)"""
+    """Import all animations from a CryEngine 1 CAL file"""
     bl_idname  = "import_scene.cal"
     bl_label   = "Import CAL Animation List"
     bl_options = {'REGISTER', 'UNDO'}
@@ -132,6 +131,77 @@ class ImportCAL(bpy.types.Operator, ImportHelper):
         return cgf_builder.load_cal(self, context, self.filepath)
 
 
+# ── CGF exporter ──────────────────────────────────────────────────────────────
+
+class ExportCGF(bpy.types.Operator, ExportHelper):
+    """Export to CryEngine 1 CGF geometry file (Far Cry)"""
+    bl_idname  = "export_scene.cgf"
+    bl_label   = "Export CGF"
+    bl_options = {'PRESET'}
+
+    filename_ext = ".cgf"
+    filter_glob: StringProperty(default="*.cgf", options={'HIDDEN'})
+
+    export_materials: BoolProperty(name="Export Materials",
+        description="Write material chunks", default=True)
+    export_skeleton: BoolProperty(name="Export Skeleton",
+        description="Write bone chunks from active armature", default=True)
+    export_weights: BoolProperty(name="Export Vertex Weights",
+        description="Write physique (bone weights)", default=True)
+    selected_only: BoolProperty(name="Selected Only",
+        description="Export only selected mesh objects", default=False)
+
+    def execute(self, context):
+        return cgf_exporter.export_cgf(
+            self, context, self.filepath,
+            export_materials = self.export_materials,
+            export_skeleton  = self.export_skeleton,
+            export_weights   = self.export_weights,
+            selected_only    = self.selected_only,
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Geometry", icon='MESH_DATA')
+        box.prop(self, "selected_only")
+        box.prop(self, "export_materials")
+        box = layout.box()
+        box.label(text="Skinning", icon='ARMATURE_DATA')
+        box.prop(self, "export_skeleton")
+        box.prop(self, "export_weights")
+
+
+# ── CAF exporter ──────────────────────────────────────────────────────────────
+
+class ExportCAF(bpy.types.Operator, ExportHelper):
+    """Export active action to CryEngine 1 CAF animation file"""
+    bl_idname  = "export_scene.caf"
+    bl_label   = "Export CAF Animation"
+    bl_options = {'PRESET'}
+
+    filename_ext = ".caf"
+    filter_glob: StringProperty(default="*.caf", options={'HIDDEN'})
+
+    def execute(self, context):
+        return cgf_exporter.export_caf(self, context, self.filepath)
+
+
+# ── CAL exporter ──────────────────────────────────────────────────────────────
+
+class ExportCAL(bpy.types.Operator, ExportHelper):
+    """Export all actions to CAF files and write a CAL list"""
+    bl_idname  = "export_scene.cal"
+    bl_label   = "Export CAL Animation List"
+    bl_options = {'PRESET'}
+
+    filename_ext = ".cal"
+    filter_glob: StringProperty(default="*.cal", options={'HIDDEN'})
+
+    def execute(self, context):
+        return cgf_exporter.export_cal(self, context, self.filepath)
+
+
 # ── Menu entries ──────────────────────────────────────────────────────────────
 
 def menu_import(self, context):
@@ -140,18 +210,32 @@ def menu_import(self, context):
     self.layout.operator(ImportCAL.bl_idname, text="CryEngine Animation List (.cal)")
 
 
+def menu_export(self, context):
+    self.layout.operator(ExportCGF.bl_idname, text="CryEngine Geometry (.cgf)")
+    self.layout.operator(ExportCAF.bl_idname, text="CryEngine Animation (.caf)")
+    self.layout.operator(ExportCAL.bl_idname, text="CryEngine Animation List (.cal)")
+
+
 def register():
     bpy.utils.register_class(ImportCGF)
     bpy.utils.register_class(ImportCAF)
     bpy.utils.register_class(ImportCAL)
+    bpy.utils.register_class(ExportCGF)
+    bpy.utils.register_class(ExportCAF)
+    bpy.utils.register_class(ExportCAL)
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
+    bpy.types.TOPBAR_MT_file_export.append(menu_export)
 
 
 def unregister():
     bpy.utils.unregister_class(ImportCGF)
     bpy.utils.unregister_class(ImportCAF)
     bpy.utils.unregister_class(ImportCAL)
+    bpy.utils.unregister_class(ExportCGF)
+    bpy.utils.unregister_class(ExportCAF)
+    bpy.utils.unregister_class(ExportCAL)
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_export)
 
 
 if __name__ == "__main__":
