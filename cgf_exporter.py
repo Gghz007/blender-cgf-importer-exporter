@@ -6,6 +6,7 @@ import bpy
 import os
 import math
 import mathutils
+import struct
 
 from .cgf_writer import (
     CGFWriter,
@@ -89,6 +90,11 @@ def blender_quat_to_cry(q):
     return (q.x, q.y, q.z, q.w)
 
 
+def build_material_key(mat):
+    """Use the preserved CGF material identity when available."""
+    return mat.get('cgf_full_name', mat.name)
+
+
 def quat_log(q):
     """
     Quaternion logarithm — inverse of quat_exp used in reader.
@@ -123,7 +129,7 @@ def triangulate_mesh(obj):
     return mesh
 
 
-def extract_mesh_data(obj, arm_obj=None):
+def extract_mesh_data(obj, arm_obj=None, bone_name_list=None):
     """
     Extract vertices, faces, UVs, normals, and bone weights from a Blender mesh.
     Returns dict with all data ready for build_mesh_chunk.
@@ -133,13 +139,12 @@ def extract_mesh_data(obj, arm_obj=None):
     if hasattr(mesh, 'calc_normals_split'):
         mesh.calc_normals_split()
 
-    # World matrix relative to armature (or world)
+    # Vertex data stays in object local space; the Node chunk carries object placement.
+    # Bone link offsets, however, need armature-local positions for skinned meshes.
     if arm_obj:
-        world_mat = arm_obj.matrix_world.inverted() @ obj.matrix_world
+        armature_local_mat = arm_obj.matrix_world.inverted() @ obj.matrix_world
     else:
-        world_mat = obj.matrix_world
-
-    normal_mat = world_mat.to_3x3().inverted().transposed()
+        armature_local_mat = obj.matrix_world
 
     vertices   = []  # (pos_cry, normal_cry)
     faces      = []  # (v0, v1, v2, mat_id, smooth_group)
@@ -163,13 +168,13 @@ def extract_mesh_data(obj, arm_obj=None):
             vi   = loop.vertex_index
 
             # Position
-            pos_bl = world_mat @ mesh.vertices[vi].co
+            pos_bl = mesh.vertices[vi].co
             pos_cry = (pos_bl.x * METERS_TO_INCHES,
                        pos_bl.y * METERS_TO_INCHES,
                        pos_bl.z * METERS_TO_INCHES)
 
             # Normal (split normal)
-            n_bl = normal_mat @ loop.normal
+            n_bl = loop.normal.copy()
             if n_bl.length > 1e-6:
                 n_bl.normalize()
             nor_cry = (n_bl.x, n_bl.y, n_bl.z)
@@ -204,7 +209,7 @@ def extract_mesh_data(obj, arm_obj=None):
     has_bone_info = False
     if arm_obj and obj.vertex_groups:
         # Build bone name → index map from armature
-        bone_names = [b.name for b in arm_obj.data.bones]
+        bone_names = bone_name_list or [b.name for b in arm_obj.data.bones]
         bone_idx   = {name: i for i, name in enumerate(bone_names)}
 
         physique = []
@@ -219,11 +224,12 @@ def extract_mesh_data(obj, arm_obj=None):
                 vg = obj.vertex_groups[g.group]
                 if vg.name in bone_idx and g.weight > 0.0:
                     bid = bone_idx[vg.name]
-                    # offset = vertex position in bone local space
-                    bone = arm_obj.pose.bones[vg.name]
-                    bone_mat_inv = bone.matrix.inverted()
-                    pos_world = obj.matrix_world @ vert.co
-                    offset_bl = bone_mat_inv @ pos_world
+                    # CryEngine stores the offset in rest-bone local space.
+                    bone = arm_obj.data.bones.get(vg.name)
+                    if bone is None:
+                        continue
+                    pos_arm = armature_local_mat @ vert.co
+                    offset_bl = bone.matrix_local.inverted() @ pos_arm
                     offset_cry = (offset_bl.x * METERS_TO_INCHES,
                                   offset_bl.y * METERS_TO_INCHES,
                                   offset_bl.z * METERS_TO_INCHES)
@@ -255,6 +261,71 @@ def extract_armature_data(arm_obj):
     """
     arm = arm_obj.data
     bones = arm.bones
+
+    # Prefer original imported Cry bone ids when they are available.
+    imported_pose_bones = []
+    if arm_obj.pose:
+        for bone in bones:
+            if bone.name not in arm_obj.pose.bones:
+                continue
+            pbone = arm_obj.pose.bones[bone.name]
+            if 'cry_bone_id' not in pbone:
+                imported_pose_bones = []
+                break
+            imported_pose_bones.append((int(pbone['cry_bone_id']), bone, pbone))
+
+    if imported_pose_bones and len(imported_pose_bones) == len(bones):
+        imported_pose_bones.sort(key=lambda item: item[0])
+        sorted_bones = [bone for _, bone, _ in imported_pose_bones]
+        bone_idx = {b.name: i for i, b in enumerate(sorted_bones)}
+
+        result = []
+        for i, bone in enumerate(sorted_bones):
+            pbone = arm_obj.pose.bones.get(bone.name)
+            parent_id = int(pbone.get('cry_parent_id', -1)) if pbone else -1
+            num_children = sum(
+                1 for other in arm_obj.pose.bones
+                if int(other.get('cry_parent_id', -999999)) == i
+            ) if arm_obj.pose else len(bone.children)
+
+            ctrl_id = ctrl_id_from_name(bone.name)
+            custom_property = ''
+            mesh_id = -1
+            flags = 0xFFFFFFFF
+
+            if pbone:
+                stored = pbone.get('cry_ctrl_id')
+                if stored:
+                    try:
+                        ctrl_id = int(stored, 16)
+                    except Exception:
+                        pass
+                custom_property = pbone.get('cry_custom_property', '')
+                mesh_id = int(pbone.get('cry_bone_mesh_id', -1))
+                stored_flags = pbone.get('cry_bone_flags', 'FFFFFFFF')
+                if isinstance(stored_flags, str):
+                    try:
+                        flags = int(stored_flags, 16)
+                    except Exception:
+                        flags = 0xFFFFFFFF
+                else:
+                    flags = int(stored_flags)
+
+            result.append({
+                'bone_id':        i,
+                'name':           bone.name,
+                'parent_id':      parent_id,
+                'num_children':   num_children,
+                'ctrl_id':        ctrl_id,
+                'custom_property': custom_property,
+                'bone_physics': {
+                    'mesh_id': mesh_id,
+                    'flags': flags,
+                },
+                'bone':           bone,
+            })
+
+        return result, bone_idx
 
     # Topological sort: parents before children
     sorted_bones = []
@@ -288,6 +359,20 @@ def extract_armature_data(arm_obj):
                     ctrl_id = int(stored, 16)
                 except Exception:
                     pass
+            custom_property = pbone.get('cry_custom_property', '')
+            mesh_id = int(pbone.get('cry_bone_mesh_id', -1))
+            stored_flags = pbone.get('cry_bone_flags', 'FFFFFFFF')
+            if isinstance(stored_flags, str):
+                try:
+                    flags = int(stored_flags, 16)
+                except Exception:
+                    flags = 0xFFFFFFFF
+            else:
+                flags = int(stored_flags)
+        else:
+            custom_property = ''
+            mesh_id = -1
+            flags = 0xFFFFFFFF
 
         result.append({
             'bone_id':        i,
@@ -295,8 +380,11 @@ def extract_armature_data(arm_obj):
             'parent_id':      parent_id,
             'num_children':   num_children,
             'ctrl_id':        ctrl_id,
-            'custom_property': '',
-            'bone_physics':   None,  # zeros
+            'custom_property': custom_property,
+            'bone_physics': {
+                'mesh_id': mesh_id,
+                'flags': flags,
+            },
             'bone':           bone,  # keep reference for matrix
         })
 
@@ -372,7 +460,11 @@ def extract_materials(obj):
                     if bc and bc.links:
                         tex_node = bc.links[0].from_node
                         if tex_node.type == 'TEX_IMAGE' and tex_node.image:
-                            tex_diff = tex_node.image.filepath_raw or tex_node.image.name
+                            tex_diff = bpy.path.abspath(
+                                tex_node.image.filepath_raw or
+                                tex_node.image.filepath or
+                                tex_node.image.name
+                            )
                     # Normal/bump textures via Normal input
                     normal_input = node.inputs.get('Normal')
                     if normal_input and normal_input.links:
@@ -383,14 +475,22 @@ def extract_materials(obj):
                             if color_in and color_in.links:
                                 t = color_in.links[0].from_node
                                 if t.type == 'TEX_IMAGE' and t.image:
-                                    tex_bump = t.image.filepath_raw or t.image.name
+                                    tex_bump = bpy.path.abspath(
+                                        t.image.filepath_raw or
+                                        t.image.filepath or
+                                        t.image.name
+                                    )
                         elif norm_node.type == 'BUMP':
                             # Bump node → heightmap → slot 9 (detail)
                             height_in = norm_node.inputs.get('Height')
                             if height_in and height_in.links:
                                 t = height_in.links[0].from_node
                                 if t.type == 'TEX_IMAGE' and t.image:
-                                    tex_detail = t.image.filepath_raw or t.image.name
+                                    tex_detail = bpy.path.abspath(
+                                        t.image.filepath_raw or
+                                        t.image.filepath or
+                                        t.image.name
+                                    )
 
         result.append({
             'name':        mat.get('cgf_full_name', mat.name),
@@ -427,6 +527,81 @@ def _to_game_relative(path, game_root_path):
     path = base + '.dds'
     # Convert to backslashes (CryEngine convention)
     return path.replace('/', '\\')
+
+
+def _get_node_local_matrix(obj, arm_obj=None):
+    """Node transform in armature-local space for skinned meshes, world space otherwise."""
+    if arm_obj:
+        return arm_obj.matrix_world.inverted() @ obj.matrix_world
+    return obj.matrix_world.copy()
+
+
+def _read_chunk_headers_raw(data):
+    if data[:6] != b'CryTek':
+        return None, []
+    chunk_table_pos, = struct.unpack_from('<I', data, 16)
+    num_chunks, = struct.unpack_from('<I', data, chunk_table_pos)
+    table_start = chunk_table_pos + 4
+    headers = []
+    for i in range(num_chunks):
+        chunk_type, = struct.unpack_from('<H', data, table_start + i * 16)
+        version, file_offset, chunk_id = struct.unpack_from(
+            '<III', data, table_start + i * 16 + 4
+        )
+        headers.append({
+            'type': chunk_type,
+            'version': version,
+            'file_offset': file_offset,
+            'chunk_id': chunk_id,
+        })
+    headers.sort(key=lambda h: (h['file_offset'], h['type'], h['chunk_id']))
+    return chunk_table_pos, headers
+
+
+def _load_preserved_source_chunks(source_path):
+    """
+    Preserve original character-support chunks that current exporter does not rebuild yet.
+    This is primarily for round-trip compatibility with imported CE1 character assets.
+    """
+    if not source_path or not os.path.isfile(source_path):
+        return []
+
+    with open(source_path, 'rb') as f:
+        data = f.read()
+
+    chunk_table_pos, headers = _read_chunk_headers_raw(data)
+    if chunk_table_pos is None:
+        return []
+
+    preserve_types = {
+        0x0009,  # LIGHT
+        0x000F,  # BONE_MESH
+        0x0010,  # BONE_LIGHT_BIND
+        0x0011,  # MESH_MORPH_TARGET
+    }
+    preserved = []
+    for i, h in enumerate(headers):
+        next_pos = headers[i + 1]['file_offset'] if i + 1 < len(headers) else chunk_table_pos
+        chunk_data = data[h['file_offset'] + 16:next_pos]
+
+        if h['type'] == 0x000B:
+            # Preserve helper/hitspot nodes from original files.
+            try:
+                name_raw = chunk_data[:64]
+                nul = name_raw.find(b'\x00')
+                if nul >= 0:
+                    name_raw = name_raw[:nul]
+                name = name_raw.decode('latin1', errors='replace')
+                object_id, parent_id, num_children, material_id = struct.unpack_from('<iiIi', chunk_data, 64)
+                if material_id == -1 or name.startswith('_hs_'):
+                    preserved.append((h['type'], h['version'], h['chunk_id'], chunk_data))
+            except Exception:
+                pass
+            continue
+
+        if h['type'] in preserve_types:
+            preserved.append((h['type'], h['version'], h['chunk_id'], chunk_data))
+    return preserved
 
 
 def export_cgf(operator, context, filepath,
@@ -484,6 +659,9 @@ def export_cgf(operator, context, filepath,
         print(f"[CGF Export] Extracting armature: {arm_obj.name}")
         bone_data_list, bone_idx = extract_armature_data(arm_obj)
         bone_name_list = [b['name'] for b in bone_data_list]
+        source_path = arm_obj.get('cgf_source_path', '')
+    else:
+        source_path = ''
 
     # Assign chunk IDs upfront so Node can reference Mesh and Material
     # Original order: SourceInfo, Timing, Node, MultiMat, Mesh, StandardMats, BoneAnim, BoneNames
@@ -514,7 +692,7 @@ def export_cgf(operator, context, filepath,
             children = []
             for s in obj.material_slots:
                 if s.material:
-                    key = s.material.get('cgf_full_name', s.material.name)
+                    key = build_material_key(s.material)
                     if key in mat_chunk_ids:
                         children.append(mat_chunk_ids[key])
             if children:
@@ -547,13 +725,16 @@ def export_cgf(operator, context, filepath,
     for obj in objects:
         mesh_cid = obj_mesh_ids[obj.name]
         node_cid = obj_node_ids[obj.name]
-        ctrl_id  = ctrl_id_from_name(obj.name)
+        node_mat = _get_node_local_matrix(obj, arm_obj if export_weights else None)
+        loc, rot, scale = node_mat.decompose()
 
         if export_materials:
             if obj.name in obj_multi_ids:
                 mat_id = obj_multi_ids[obj.name]
             elif obj.material_slots and obj.material_slots[0].material:
-                mat_id = mat_chunk_ids.get(obj.material_slots[0].material.name, -1)
+                mat_id = mat_chunk_ids.get(
+                    build_material_key(obj.material_slots[0].material), -1
+                )
             else:
                 mat_id = -1
         else:
@@ -564,13 +745,13 @@ def export_cgf(operator, context, filepath,
             object_id    = mesh_cid,
             parent_id    = -1,
             material_id  = mat_id,
-            trans_matrix = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,0],
-            position     = (0.0, 0.0, 0.0),
-            rotation     = (0.0, 0.0, 0.0, 1.0),
-            scale        = (1.0, 1.0, 1.0),
-            pos_ctrl_id   = ctrl_id,
-            rot_ctrl_id   = ctrl_id,
-            scale_ctrl_id = ctrl_id,
+            trans_matrix = blender_matrix_to_cry(node_mat),
+            position     = blender_vec_to_cry(loc),
+            rotation     = blender_quat_to_cry(rot),
+            scale        = (scale.x, scale.y, scale.z),
+            pos_ctrl_id   = 0xFFFFFFFF,
+            rot_ctrl_id   = 0xFFFFFFFF,
+            scale_ctrl_id = 0xFFFFFFFF,
         )
         writer.add_chunk(CT_NODE, ver, node_cid, data)
 
@@ -581,7 +762,7 @@ def export_cgf(operator, context, filepath,
                 children = []
                 for s in obj.material_slots:
                     if s.material:
-                        key = s.material.get('cgf_full_name', s.material.name)
+                        key = build_material_key(s.material)
                         if key in mat_chunk_ids:
                             children.append(mat_chunk_ids[key])
                 cid = obj_multi_ids[obj.name]
@@ -589,7 +770,7 @@ def export_cgf(operator, context, filepath,
                 first_mat = obj.material_slots[0].material if obj.material_slots else None
                 base_name = ''
                 if first_mat:
-                    full = first_mat.get('cgf_full_name', first_mat.name)
+                    full = build_material_key(first_mat)
                     base_name = full.split('(')[0].split('/')[0]
                 data, ver, _ = build_material_chunk(
                     cid, base_name, mat_type=2, children=children
@@ -599,7 +780,11 @@ def export_cgf(operator, context, filepath,
     # 5. Mesh chunks (with embedded BoneInitialPos)
     for obj in objects:
         print(f"[CGF Export] Extracting mesh: {obj.name}")
-        md = extract_mesh_data(obj, arm_obj if export_weights else None)
+        md = extract_mesh_data(
+            obj,
+            arm_obj if export_weights else None,
+            bone_name_list if export_weights else None,
+        )
 
         mesh_cid = obj_mesh_ids[obj.name]
 
@@ -650,6 +835,260 @@ def export_cgf(operator, context, filepath,
 
         data, ver, cid = build_bone_name_list_chunk(next_id(), bone_name_list)
         writer.add_chunk(CT_BNAMES, ver, cid, data)
+
+    # 8. Preserve original CE1 character-support chunks when round-tripping from source.
+    for p_type, p_ver, p_cid, p_data in _load_preserved_source_chunks(source_path):
+        writer.add_chunk(p_type, p_ver, p_cid, p_data)
+
+    writer.write(filepath)
+    print(f"[CGF Export] Written: {filepath}")
+    operator.report({'INFO'}, f"Exported {len(objects)} mesh(es) to {os.path.basename(filepath)}")
+    return {'FINISHED'}
+
+
+def export_cgf_scene(operator, context, filepath,
+                     export_materials=True, export_skeleton=True,
+                     export_weights=True, selected_only=False):
+    """
+    Updated geometry exporter.
+    For skinned .cga exports, writes an extra export-only root helper at 0,0,0
+    and parents skinned mesh nodes to it.
+    """
+    game_root_path = ""
+    prefs = context.preferences.addons.get('io_import_cgf')
+    if prefs:
+        game_root_path = prefs.preferences.game_root_path
+
+    if selected_only:
+        objects = [o for o in context.selected_objects if o.type == 'MESH' and not o.hide_get()]
+    else:
+        objects = [o for o in context.view_layer.objects if o.type == 'MESH' and not o.hide_get() and o.visible_get()]
+
+    if not objects:
+        operator.report({'ERROR'}, "No visible mesh objects found")
+        return {'CANCELLED'}
+
+    arm_obj = None
+    if export_skeleton:
+        for obj in context.view_layer.objects:
+            if obj.type == 'ARMATURE' and not obj.hide_get():
+                arm_obj = obj
+                break
+        if arm_obj is None:
+            for obj in objects:
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object:
+                        arm_obj = mod.object
+                        break
+
+    writer = CGFWriter(is_anim=False)
+    export_ext = os.path.splitext(filepath)[1].lower()
+    chunk_id = 0
+
+    def next_id():
+        nonlocal chunk_id
+        chunk_id += 1
+        return chunk_id
+
+    bone_data_list = []
+    bone_name_list = []
+    if arm_obj and export_skeleton:
+        print(f"[CGF Export] Extracting armature: {arm_obj.name}")
+        bone_data_list, _ = extract_armature_data(arm_obj)
+        bone_name_list = [b['name'] for b in bone_data_list]
+        source_path = arm_obj.get('cgf_source_path', '')
+    else:
+        source_path = ''
+
+    mat_chunk_ids = {}
+    all_standard_mats = []
+    obj_multi_ids = {}
+    if export_materials:
+        for obj in objects:
+            mats = extract_materials(obj)
+            for mat in mats:
+                if mat['name'] not in mat_chunk_ids:
+                    cid = next_id()
+                    mat_chunk_ids[mat['name']] = cid
+                    all_standard_mats.append((cid, mat))
+
+    obj_mesh_ids = {}
+    obj_node_ids = {}
+    skinned_objects = []
+    for obj in objects:
+        is_skinned_obj = bool(
+            arm_obj and export_weights and any(
+                mod.type == 'ARMATURE' and mod.object == arm_obj
+                for mod in obj.modifiers
+            )
+        )
+        if is_skinned_obj:
+            skinned_objects.append(obj)
+        obj_mesh_ids[obj.name] = next_id()
+        obj_node_ids[obj.name] = next_id()
+        if export_materials and len(obj.material_slots) > 1:
+            children = []
+            for s in obj.material_slots:
+                if s.material:
+                    key = build_material_key(s.material)
+                    if key in mat_chunk_ids:
+                        children.append(mat_chunk_ids[key])
+            if children:
+                obj_multi_ids[obj.name] = next_id()
+
+    use_root_helper = bool(skinned_objects) and export_ext == '.cga'
+    root_helper_id = next_id() if use_root_helper else None
+
+    import getpass, datetime
+    data, ver, cid = build_source_info_chunk(
+        next_id(),
+        source_file=filepath,
+        date=datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"),
+        user=getpass.getuser()
+    )
+    writer.add_chunk(CT_SRCINFO, ver, cid, data)
+
+    scene = context.scene
+    fps = scene.render.fps
+    ticks_per_frame = 160
+    secs_per_tick = 1.0 / (fps * ticks_per_frame)
+    data, ver, cid = build_timing_chunk(
+        next_id(), ticks_per_frame, secs_per_tick,
+        scene.frame_start, scene.frame_end
+    )
+    writer.add_chunk(CT_TIMING, ver, cid, data)
+
+    if use_root_helper:
+        ident44 = (
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        root_helper_name = "Fbx_Root"
+        data, ver, _ = build_node_chunk(
+            root_helper_id,
+            root_helper_name,
+            object_id=-1,
+            parent_id=-1,
+            material_id=-1,
+            trans_matrix=ident44,
+            position=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+            scale=(1.0, 1.0, 1.0),
+            pos_ctrl_id=0xFFFFFFFF,
+            rot_ctrl_id=0xFFFFFFFF,
+            scale_ctrl_id=0xFFFFFFFF,
+            child_nodes=[obj_node_ids[obj.name] for obj in skinned_objects],
+        )
+        writer.add_chunk(CT_NODE, ver, root_helper_id, data)
+
+    for obj in objects:
+        mesh_cid = obj_mesh_ids[obj.name]
+        node_cid = obj_node_ids[obj.name]
+        node_mat = _get_node_local_matrix(obj, arm_obj if export_weights else None)
+        loc, rot, scale = node_mat.decompose()
+        is_skinned_obj = obj in skinned_objects
+
+        if export_materials:
+            if obj.name in obj_multi_ids:
+                mat_id = obj_multi_ids[obj.name]
+            elif obj.material_slots and obj.material_slots[0].material:
+                mat_id = mat_chunk_ids.get(build_material_key(obj.material_slots[0].material), -1)
+            else:
+                mat_id = -1
+        else:
+            mat_id = -1
+
+        data, ver, _ = build_node_chunk(
+            node_cid, obj.name,
+            object_id=mesh_cid,
+            parent_id=root_helper_id if (use_root_helper and is_skinned_obj) else -1,
+            material_id=mat_id,
+            trans_matrix=blender_matrix_to_cry(node_mat),
+            position=blender_vec_to_cry(loc),
+            rotation=blender_quat_to_cry(rot),
+            scale=(scale.x, scale.y, scale.z),
+            pos_ctrl_id=0xFFFFFFFF,
+            rot_ctrl_id=0xFFFFFFFF,
+            scale_ctrl_id=0xFFFFFFFF,
+        )
+        writer.add_chunk(CT_NODE, ver, node_cid, data)
+
+    if export_materials:
+        for obj in objects:
+            if obj.name in obj_multi_ids:
+                children = []
+                for s in obj.material_slots:
+                    if s.material:
+                        key = build_material_key(s.material)
+                        if key in mat_chunk_ids:
+                            children.append(mat_chunk_ids[key])
+                cid = obj_multi_ids[obj.name]
+                first_mat = obj.material_slots[0].material if obj.material_slots else None
+                base_name = ''
+                if first_mat:
+                    full = build_material_key(first_mat)
+                    base_name = full.split('(')[0].split('/')[0]
+                data, ver, _ = build_material_chunk(cid, base_name, mat_type=2, children=children)
+                writer.add_chunk(CT_MAT, ver, cid, data)
+
+    for obj in objects:
+        print(f"[CGF Export] Extracting mesh: {obj.name}")
+        md = extract_mesh_data(
+            obj,
+            arm_obj if export_weights else None,
+            bone_name_list if export_weights else None,
+        )
+        mesh_cid = obj_mesh_ids[obj.name]
+        bone_matrices = None
+        bipos_cid = None
+        if md['has_bone_info'] and arm_obj and bone_data_list:
+            bone_matrices = extract_bone_matrices(arm_obj, bone_data_list)
+            bipos_cid = next_id()
+
+        data, ver, _, bipos_offset = build_mesh_chunk(
+            mesh_cid,
+            vertices=md['vertices'],
+            faces=md['faces'],
+            tex_vertices=md['tex_verts'],
+            tex_faces=md['tex_faces'],
+            physique=md['physique'],
+            has_bone_info=md['has_bone_info'],
+            bone_matrices=bone_matrices,
+        )
+        mesh_chunk_idx = len(writer.chunks)
+        writer.add_chunk(CT_MESH, ver, mesh_cid, data)
+
+        if bone_matrices and bipos_offset is not None:
+            writer.add_embedded_chunk_entry(
+                CT_BIPOS, 0x0001, bipos_cid,
+                mesh_chunk_idx, bipos_offset
+            )
+
+    if export_materials:
+        for cid, mat in all_standard_mats:
+            data, ver, _ = build_material_chunk(
+                cid, mat['name'],
+                mat_type=1,
+                diffuse=mat['diffuse'],
+                specular=mat['specular'],
+                opacity=mat['opacity'],
+                tex_diffuse=_to_game_relative(mat.get('tex_diffuse', ''), game_root_path),
+                tex_bump=_to_game_relative(mat.get('tex_bump', ''), game_root_path),
+                tex_detail=_to_game_relative(mat.get('tex_detail', ''), game_root_path),
+            )
+            writer.add_chunk(CT_MAT, ver, cid, data)
+
+    if arm_obj and export_skeleton and bone_data_list:
+        data, ver, cid = build_bone_anim_chunk(next_id(), bone_data_list)
+        writer.add_chunk(CT_BANIM, ver, cid, data)
+
+        data, ver, cid = build_bone_name_list_chunk(next_id(), bone_name_list)
+        writer.add_chunk(CT_BNAMES, ver, cid, data)
+
+    for p_type, p_ver, p_cid, p_data in _load_preserved_source_chunks(source_path):
+        writer.add_chunk(p_type, p_ver, p_cid, p_data)
 
     writer.write(filepath)
     print(f"[CGF Export] Written: {filepath}")
