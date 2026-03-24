@@ -28,6 +28,7 @@ from .cgf_writer import (
 )
 
 from .cgf_reader import (
+    ChunkReader,
     CHUNK_TYPE_MESH       as CT_MESH,
     CHUNK_TYPE_NODE       as CT_NODE,
     CHUNK_TYPE_MATERIAL   as CT_MAT,
@@ -93,6 +94,16 @@ def blender_quat_to_cry(q):
 def build_material_key(mat):
     """Use the preserved CGF material identity when available."""
     return mat.get('cgf_full_name', mat.name)
+
+
+def _build_cgf_mat_name(name, shader_name, surface_name):
+    """Reconstruct full CGF material name: 'name(shader)/surface'."""
+    result = name
+    if shader_name:
+        result += f"({shader_name})"
+    if surface_name:
+        result += f"/{surface_name}"
+    return result
 
 
 def quat_log(q):
@@ -494,6 +505,8 @@ def extract_materials(obj):
 
         result.append({
             'name':        mat.get('cgf_full_name', mat.name),
+            'source_name': mat.get('cgf_source_name', mat.name),
+            'chunk_id':    int(mat.get('cgf_chunk_id', -1)),
             'diffuse':     diffuse,
             'specular':    specular,
             'opacity':     opacity,
@@ -602,6 +615,98 @@ def _load_preserved_source_chunks(source_path):
         if h['type'] in preserve_types:
             preserved.append((h['type'], h['version'], h['chunk_id'], chunk_data))
     return preserved
+
+
+def _load_source_roundtrip_metadata(source_path):
+    if not source_path or not os.path.isfile(source_path):
+        return {
+            'max_chunk_id': 0,
+            'source_info_id': None,
+            'timing_id': None,
+            'bone_anim_id': None,
+            'bone_name_list_id': None,
+            'bone_initial_pos_id': None,
+            'node_ids_by_name': {},
+            'mesh_ids_by_name': {},
+            'multi_material_id_by_name': {},
+            'material_ids_by_full_name': {},
+            'material_ids_by_source_name': {},
+        }
+
+    with open(source_path, 'rb') as f:
+        data = f.read()
+    _, headers = _read_chunk_headers_raw(data)
+
+    meta = {
+        'max_chunk_id': max((h['chunk_id'] for h in headers), default=0),
+        'source_info_id': None,
+        'timing_id': None,
+        'bone_anim_id': None,
+        'bone_name_list_id': None,
+        'bone_initial_pos_id': None,
+        'node_ids_by_name': {},
+        'mesh_ids_by_name': {},
+        'multi_material_id_by_name': {},
+        'material_ids_by_full_name': {},
+        'material_ids_by_source_name': {},
+    }
+
+    for h in headers:
+        if h['type'] == CT_SRCINFO and meta['source_info_id'] is None:
+            meta['source_info_id'] = h['chunk_id']
+        elif h['type'] == CT_TIMING and meta['timing_id'] is None:
+            meta['timing_id'] = h['chunk_id']
+        elif h['type'] == CT_BANIM and meta['bone_anim_id'] is None:
+            meta['bone_anim_id'] = h['chunk_id']
+        elif h['type'] == CT_BNAMES and meta['bone_name_list_id'] is None:
+            meta['bone_name_list_id'] = h['chunk_id']
+        elif h['type'] == CT_BIPOS and meta['bone_initial_pos_id'] is None:
+            meta['bone_initial_pos_id'] = h['chunk_id']
+
+    try:
+        archive = ChunkReader().read_file(source_path)
+    except Exception:
+        return meta
+
+    for node in archive.node_chunks:
+        meta['node_ids_by_name'].setdefault(node.name, node.header.chunk_id)
+        if node.object_id is not None and node.object_id >= 0:
+            meta['mesh_ids_by_name'].setdefault(node.name, int(node.object_id))
+        if node.material_id is not None and node.material_id >= 0:
+            meta['multi_material_id_by_name'].setdefault(node.name, int(node.material_id))
+
+    for mat in archive.material_chunks:
+        full_name = _build_cgf_mat_name(mat.name, mat.shader_name, mat.surface_name)
+        meta['material_ids_by_full_name'].setdefault(full_name, mat.header.chunk_id)
+        meta['material_ids_by_source_name'].setdefault(mat.name, mat.header.chunk_id)
+
+    return meta
+
+
+def _safe_int(value, default=None):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _make_chunk_id_allocator(source_meta=None):
+    used = set()
+    next_auto = max(1, int((source_meta or {}).get('max_chunk_id', 0)) + 1)
+
+    def allocate(preferred=None):
+        nonlocal next_auto
+        if preferred is not None and preferred > 0 and preferred not in used:
+            used.add(preferred)
+            return preferred
+        while next_auto in used:
+            next_auto += 1
+        cid = next_auto
+        used.add(cid)
+        next_auto += 1
+        return cid
+
+    return allocate
 
 
 def export_cgf(operator, context, filepath,
@@ -900,6 +1005,9 @@ def export_cgf_scene(operator, context, filepath,
     else:
         source_path = ''
 
+    source_meta = _load_source_roundtrip_metadata(source_path)
+    allocate_chunk_id = _make_chunk_id_allocator(source_meta)
+
     mat_chunk_ids = {}
     all_standard_mats = []
     obj_multi_ids = {}
@@ -908,7 +1016,14 @@ def export_cgf_scene(operator, context, filepath,
             mats = extract_materials(obj)
             for mat in mats:
                 if mat['name'] not in mat_chunk_ids:
-                    cid = next_id()
+                    preferred_mat_id = _safe_int(mat.get('chunk_id'), None)
+                    if preferred_mat_id is not None and preferred_mat_id <= 0:
+                        preferred_mat_id = None
+                    cid = allocate_chunk_id(
+                        preferred_mat_id
+                        or source_meta['material_ids_by_full_name'].get(mat['name'])
+                        or source_meta['material_ids_by_source_name'].get(mat.get('source_name', ''))
+                    )
                     mat_chunk_ids[mat['name']] = cid
                     all_standard_mats.append((cid, mat))
 
@@ -924,8 +1039,13 @@ def export_cgf_scene(operator, context, filepath,
         )
         if is_skinned_obj:
             skinned_objects.append(obj)
-        obj_mesh_ids[obj.name] = next_id()
-        obj_node_ids[obj.name] = next_id()
+        obj_mesh_ids[obj.name] = allocate_chunk_id(
+            _safe_int(obj.get('cgf_chunk_id'), None) or
+            source_meta['mesh_ids_by_name'].get(obj.name)
+        )
+        obj_node_ids[obj.name] = allocate_chunk_id(
+            source_meta['node_ids_by_name'].get(obj.name)
+        )
         if export_materials and len(obj.material_slots) > 1:
             children = []
             for s in obj.material_slots:
@@ -934,14 +1054,16 @@ def export_cgf_scene(operator, context, filepath,
                     if key in mat_chunk_ids:
                         children.append(mat_chunk_ids[key])
             if children:
-                obj_multi_ids[obj.name] = next_id()
+                obj_multi_ids[obj.name] = allocate_chunk_id(
+                    source_meta['multi_material_id_by_name'].get(obj.name)
+                )
 
     use_root_helper = bool(skinned_objects) and export_ext == '.cga'
-    root_helper_id = next_id() if use_root_helper else None
+    root_helper_id = allocate_chunk_id() if use_root_helper else None
 
     import getpass, datetime
     data, ver, cid = build_source_info_chunk(
-        next_id(),
+        allocate_chunk_id(source_meta.get('source_info_id')),
         source_file=filepath,
         date=datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"),
         user=getpass.getuser()
@@ -953,7 +1075,7 @@ def export_cgf_scene(operator, context, filepath,
     ticks_per_frame = 160
     secs_per_tick = 1.0 / (fps * ticks_per_frame)
     data, ver, cid = build_timing_chunk(
-        next_id(), ticks_per_frame, secs_per_tick,
+        allocate_chunk_id(source_meta.get('timing_id')), ticks_per_frame, secs_per_tick,
         scene.frame_start, scene.frame_end
     )
     writer.add_chunk(CT_TIMING, ver, cid, data)
@@ -1045,7 +1167,7 @@ def export_cgf_scene(operator, context, filepath,
         bipos_cid = None
         if md['has_bone_info'] and arm_obj and bone_data_list:
             bone_matrices = extract_bone_matrices(arm_obj, bone_data_list)
-            bipos_cid = next_id()
+            bipos_cid = allocate_chunk_id(source_meta.get('bone_initial_pos_id'))
 
         data, ver, _, bipos_offset = build_mesh_chunk(
             mesh_cid,
@@ -1081,10 +1203,16 @@ def export_cgf_scene(operator, context, filepath,
             writer.add_chunk(CT_MAT, ver, cid, data)
 
     if arm_obj and export_skeleton and bone_data_list:
-        data, ver, cid = build_bone_anim_chunk(next_id(), bone_data_list)
+        data, ver, cid = build_bone_anim_chunk(
+            allocate_chunk_id(source_meta.get('bone_anim_id')),
+            bone_data_list
+        )
         writer.add_chunk(CT_BANIM, ver, cid, data)
 
-        data, ver, cid = build_bone_name_list_chunk(next_id(), bone_name_list)
+        data, ver, cid = build_bone_name_list_chunk(
+            allocate_chunk_id(source_meta.get('bone_name_list_id')),
+            bone_name_list
+        )
         writer.add_chunk(CT_BNAMES, ver, cid, data)
 
     for p_type, p_ver, p_cid, p_data in _load_preserved_source_chunks(source_path):
