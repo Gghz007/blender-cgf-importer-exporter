@@ -8,6 +8,11 @@ The addon focuses on practical round-trip work:
 - edit assets in Blender
 - export geometry and animation back to CryEngine 1 formats
 
+Important status note:
+
+- geometry import/export is currently the stable path
+- CAF/ANM/CAL animation import is still experimental and can produce incorrect poses compared to legacy 3ds Max CryImporter on some assets
+
 The codebase is based on the original CryImporter / CryExport toolchain used for 3ds Max and on additional legacy CryEngine exporter references.
 
 ## Supported Blender Versions
@@ -66,12 +71,13 @@ The codebase is based on the original CryImporter / CryExport toolchain used for
 - preserves bone initial matrices for round-trip export
 - applies embedded controller data from geometry files when present so rigged assets are not left only in rest pose
 
-### Animation Import
+### Animation Import (Experimental)
 
-- imports CAF and ANM animation data onto an armature
-- imports CAL files and creates separate Blender actions
-- if no armature is present, the importer can auto-load the matching CGF / CGA from the same folder
-- uses controller ids from imported Cry data to match animation tracks back to bones
+- imports CAF and ANM data onto an armature action
+- imports CAL and creates separate actions
+- if no armature is present, the importer can auto-load matching CGF/CGA from the same folder
+- uses controller ids from imported Cry data to match tracks back to bones
+- known limitation: on some weapon/character rigs the resulting pose can differ from 3ds Max CryImporter output
 
 ### Geometry Export
 
@@ -82,12 +88,13 @@ The codebase is based on the original CryImporter / CryExport toolchain used for
 - preserves stored Cry bone matrices for better round-trip behavior
 - writes vertex colors, including default white when needed for engine compatibility
 
-### Animation Export
+### Animation Export (Use With Validation)
 
 - exports the active action to CAF
 - exports the active action to ANM through the same backend path
 - exports all action tracks as CAF files plus a CAL list
 - supports automatic asset export from a single command
+- recommended: validate exported animation in target toolchain (CryEngine/Max) before production use
 
 ### Auto Export
 
@@ -109,9 +116,9 @@ Auto export inspects the current scene and writes the most useful output automat
 
 ## Addon Preferences
 
-### Game Textures Path
+### Game Data/Textures Root
 
-Set the textures path to the folder that contains directories such as:
+Set this path to the root folder that contains directories such as:
 
 - `Objects`
 - `Textures`
@@ -145,6 +152,33 @@ The filter can remove:
 - full helper meshes that are entirely collision-like
 - collision-like polygons inside mixed meshes
 - corresponding NoDraw helper materials
+
+### Enable Full Scene Setup
+
+Single master switch for scene extras during geometry import:
+
+- asset root empty
+- node transforms
+- helper/controller target empties
+- producer cameras
+
+When disabled, importer keeps scene setup minimal.
+
+## Known Animation Issues (CAF/ANM/CAL)
+
+Current known issue:
+
+- some assets import with visibly wrong rotation/pose in Blender while the same files look correct in legacy Max CryImporter
+
+Most likely technical reason:
+
+- controller keys are correct, but they are being applied in a transform space that does not fully match Max object/bone evaluation space (rest/pre-transform/pivot chain differences)
+
+What this means in practice:
+
+- geometry/skeleton data can still be valid
+- final animated pose can still be wrong on specific rigs
+- this is under active rework in animation application logic
 
 ## Import Workflows
 
