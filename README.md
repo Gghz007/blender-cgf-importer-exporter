@@ -11,7 +11,8 @@ The addon focuses on practical round-trip work:
 Important status note:
 
 - geometry import/export is currently the stable path
-- CAF/ANM/CAL animation import is still experimental and can produce incorrect poses compared to legacy 3ds Max CryImporter on some assets
+- CAF/ANM/CAL import is currently broken for many assets and can produce wrong poses/rotations
+- do not rely on CAF/ANM/CAL import results for production
 
 The codebase is based on the original CryImporter / CryExport toolchain used for 3ds Max and on additional legacy CryEngine exporter references.
 
@@ -71,13 +72,11 @@ The codebase is based on the original CryImporter / CryExport toolchain used for
 - preserves bone initial matrices for round-trip export
 - applies embedded controller data from geometry files when present so rigged assets are not left only in rest pose
 
-### Animation Import (Experimental)
+### Animation Import (Currently Broken)
 
-- imports CAF and ANM data onto an armature action
-- imports CAL and creates separate actions
-- if no armature is present, the importer can auto-load matching CGF/CGA from the same folder
-- uses controller ids from imported Cry data to match tracks back to bones
-- known limitation: on some weapon/character rigs the resulting pose can differ from 3ds Max CryImporter output
+- importer can parse CAF/ANM/CAL and create actions
+- but resulting motion/pose can be wrong (twisted bones, wrong orientation, wrong offsets)
+- current behavior does not consistently match legacy 3ds Max CryImporter
 
 ### Geometry Export
 
@@ -166,19 +165,20 @@ When disabled, importer keeps scene setup minimal.
 
 ## Known Animation Issues (CAF/ANM/CAL)
 
-Current known issue:
+Current state:
 
-- some assets import with visibly wrong rotation/pose in Blender while the same files look correct in legacy Max CryImporter
+- known broken on real assets in this repository workflow
+- same CAF/CAL can look correct in Max CryImporter and wrong in Blender
 
-Most likely technical reason:
+Most likely reason:
 
-- controller keys are correct, but they are being applied in a transform space that does not fully match Max object/bone evaluation space (rest/pre-transform/pivot chain differences)
+- transform-space mismatch between Max evaluation chain and Blender bone application path
+- keys are parsed, but final space conversion/application is not yet reliable for all rigs
 
-What this means in practice:
+Practical meaning:
 
-- geometry/skeleton data can still be valid
-- final animated pose can still be wrong on specific rigs
-- this is under active rework in animation application logic
+- use Blender import for geometry/material/weights
+- treat CAF/ANM/CAL import output as non-authoritative until this path is fixed
 
 ## Import Workflows
 
@@ -205,32 +205,22 @@ Typical results:
 - embedded controller data is applied when present in the source file
 - collision-like helper meshes can be skipped globally from addon preferences
 
-### Import CAF / ANM
+### Import CAF / ANM (Known Broken)
 
 Menu:
 
 - `File -> Import -> CryEngine Animation (.caf)`
 - `File -> Import -> CryEngine Animation (.anm)`
 
-Workflow:
+Workflow still exists, but output may be wrong. Use only for debugging.
 
-1. Import the source geometry first, or select an existing armature.
-2. Import the animation file.
-3. The addon creates or updates a Blender action on the target armature.
-
-If no armature exists, the importer tries to find a matching `.cgf` or `.cga` in the same folder and imports it automatically.
-
-### Import CAL
+### Import CAL (Known Broken)
 
 Menu:
 
 - `File -> Import -> CryEngine Animation List (.cal)`
 
-Workflow:
-
-1. Import or select the target armature.
-2. Import the CAL file.
-3. The addon resolves the listed CAF files and creates Blender actions for them.
+Workflow still exists, but output may be wrong. Use only for debugging.
 
 ## Export Workflows
 
@@ -390,7 +380,7 @@ For rigged assets:
 
 1. Import CGA or skinned CGF with skeleton and weights enabled.
 2. Verify the imported armature and material assignments.
-3. Import CAF / ANM / CAL if needed.
+3. CAF / ANM / CAL import is currently unreliable; validate against Max/Cry pipeline.
 4. Edit the mesh, rig, or actions.
 5. Export CGA, CAF, ANM, or CAL as needed.
 
