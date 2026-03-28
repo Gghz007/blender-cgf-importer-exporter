@@ -164,6 +164,8 @@ def extract_mesh_data(obj, arm_obj=None, bone_name_list=None):
 
     # We need to split vertices by UV — same position can have different UVs
     uv_layer = mesh.uv_layers.active
+    source_vert_ids = obj.get('_cgf_source_vert_ids')
+    source_smoothing_groups = obj.get('_cgf_face_smoothing_groups')
 
     # Build vertex/UV table
     vert_map = {}    # (vert_idx, uv_tuple) → new_idx
@@ -177,6 +179,12 @@ def extract_mesh_data(obj, arm_obj=None, bone_name_list=None):
         for li in poly.loop_indices:
             loop = mesh.loops[li]
             vi   = loop.vertex_index
+            src_vi = vi
+            if source_vert_ids and vi < len(source_vert_ids):
+                try:
+                    src_vi = int(source_vert_ids[vi])
+                except Exception:
+                    src_vi = vi
 
             # Position
             pos_bl = mesh.vertices[vi].co
@@ -197,7 +205,7 @@ def extract_mesh_data(obj, arm_obj=None, bone_name_list=None):
             else:
                 uv_key = (0.0, 0.0)
 
-            key = (vi, uv_key)
+            key = (src_vi, uv_key)
             if key not in vert_map:
                 vert_map[key] = len(new_verts)
                 new_verts.append((pos_cry, nor_cry))
@@ -208,8 +216,15 @@ def extract_mesh_data(obj, arm_obj=None, bone_name_list=None):
             face_tv.append(new_vi)  # tex face uses same index
 
         mat_id = poly.material_index
+        if source_smoothing_groups and poly.index < len(source_smoothing_groups):
+            try:
+                smooth_group = int(source_smoothing_groups[poly.index])
+            except Exception:
+                smooth_group = 2 if poly.use_smooth else 0
+        else:
+            smooth_group = 2 if poly.use_smooth else 0
         # CryEngine uses same winding as Blender
-        faces.append((face_vv[0], face_vv[1], face_vv[2], mat_id, poly.use_smooth))
+        faces.append((face_vv[0], face_vv[1], face_vv[2], mat_id, smooth_group))
         tex_faces.append((face_tv[0], face_tv[1], face_tv[2]))
 
     vertices  = new_verts
@@ -683,11 +698,111 @@ def _load_source_roundtrip_metadata(source_path):
     return meta
 
 
+def _load_source_archive(source_path):
+    if not source_path or not os.path.isfile(source_path):
+        return None
+    try:
+        return ChunkReader().read_file(source_path)
+    except Exception:
+        return None
+
+
 def _safe_int(value, default=None):
     try:
         return int(value)
     except Exception:
         return default
+
+
+def _resolve_action_datablock(action_candidate, arm_obj=None):
+    if action_candidate is not None and hasattr(action_candidate, 'fcurves'):
+        return action_candidate
+
+    nested = getattr(action_candidate, 'action', None)
+    if nested is not None and hasattr(nested, 'fcurves'):
+        return nested
+
+    ad = getattr(arm_obj, 'animation_data', None) if arm_obj else None
+    if ad:
+        direct = getattr(ad, 'action', None)
+        if direct is not None and hasattr(direct, 'fcurves'):
+            return direct
+        slot = getattr(ad, 'action_slot', None)
+        slot_action = getattr(slot, 'action', None) if slot else None
+        if slot_action is not None and hasattr(slot_action, 'fcurves'):
+            return slot_action
+
+    if action_candidate is not None:
+        name = getattr(action_candidate, 'name', None)
+        if name:
+            found = bpy.data.actions.get(name)
+            if found is not None and hasattr(found, 'fcurves'):
+                return found
+
+    return None
+
+
+def _action_fcurves(action_candidate):
+    action = _resolve_action_datablock(action_candidate)
+    if action is None:
+        return []
+    fcurves = getattr(action, 'fcurves', None)
+    return fcurves if fcurves is not None else []
+
+
+def _action_has_pose_fcurves(action_candidate):
+    return any(
+        getattr(fc, 'data_path', '').startswith('pose.bones[')
+        for fc in _action_fcurves(action_candidate)
+    )
+
+
+def _assign_action_to_armature(arm_obj, action):
+    resolved = _resolve_action_datablock(action, arm_obj)
+    if arm_obj is None or resolved is None:
+        return False
+    if arm_obj.animation_data is None:
+        arm_obj.animation_data_create()
+    ad = arm_obj.animation_data
+    try:
+        ad.action = resolved
+        if _resolve_action_datablock(getattr(ad, 'action', None), arm_obj) is resolved:
+            return True
+    except Exception:
+        pass
+    slot = getattr(ad, 'action_slot', None)
+    if slot is not None:
+        try:
+            slot.action = resolved
+            if _resolve_action_datablock(getattr(slot, 'action', None), arm_obj) is resolved:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _pick_export_action(arm_obj):
+    ad = getattr(arm_obj, 'animation_data', None)
+    if ad:
+        resolved = _resolve_action_datablock(getattr(ad, 'action', None), arm_obj)
+        if resolved is not None:
+            return resolved
+    for action in bpy.data.actions:
+        resolved = _resolve_action_datablock(action, arm_obj)
+        if resolved is not None and _action_has_pose_fcurves(resolved):
+            return resolved
+    return None
+
+
+def _action_frame_range(action, scene):
+    resolved = _resolve_action_datablock(action)
+    if resolved is not None:
+        try:
+            frame_range = resolved.frame_range
+            return int(frame_range[0]), int(frame_range[1])
+        except Exception:
+            pass
+    return int(scene.frame_start), int(scene.frame_end)
 
 
 def _make_chunk_id_allocator(source_meta=None):
@@ -861,7 +976,7 @@ def export_cgf(operator, context, filepath,
         writer.add_chunk(CT_NODE, ver, node_cid, data)
 
     # 4. Multi-material chunks (before mesh — original order)
-    if export_materials:
+    if export_materials and not (source_archive and source_archive.material_chunks):
         for obj in objects:
             if obj.name in obj_multi_ids:
                 children = []
@@ -1006,6 +1121,7 @@ def export_cgf_scene(operator, context, filepath,
         source_path = ''
 
     source_meta = _load_source_roundtrip_metadata(source_path)
+    source_archive = _load_source_archive(source_path)
     allocate_chunk_id = _make_chunk_id_allocator(source_meta)
 
     mat_chunk_ids = {}
@@ -1189,9 +1305,74 @@ def export_cgf_scene(operator, context, filepath,
             )
 
     if export_materials:
+        written_ids = set()
+        scene_mats_by_full = {mat['name']: mat for _, mat in all_standard_mats}
+        scene_mats_by_source = {
+            mat.get('source_name', mat['name']): mat
+            for _, mat in all_standard_mats
+        }
+
+        if source_archive and source_archive.material_chunks:
+            for src_mat in source_archive.material_chunks:
+                cid = int(src_mat.header.chunk_id)
+                if src_mat.type == 2:
+                    data, ver, _ = build_material_chunk(
+                        cid,
+                        src_mat.name,
+                        mat_type=2,
+                        children=list(src_mat.children),
+                        alpha_test=src_mat.alpha_test,
+                    )
+                else:
+                    full_name = _build_cgf_mat_name(
+                        src_mat.name,
+                        src_mat.shader_name,
+                        src_mat.surface_name,
+                    )
+                    override = (
+                        scene_mats_by_full.get(full_name) or
+                        scene_mats_by_source.get(src_mat.name)
+                    )
+                    tex_diffuse = (
+                        _to_game_relative(override.get('tex_diffuse', ''), game_root_path)
+                        if override else
+                        (src_mat.tex_diffuse.name if src_mat.tex_diffuse else '')
+                    )
+                    tex_bump = (
+                        _to_game_relative(override.get('tex_bump', ''), game_root_path)
+                        if override else
+                        (src_mat.tex_bump.name if src_mat.tex_bump else '')
+                    )
+                    tex_detail = (
+                        _to_game_relative(override.get('tex_detail', ''), game_root_path)
+                        if override else
+                        (src_mat.tex_detail.name if src_mat.tex_detail else '')
+                    )
+                    data, ver, _ = build_material_chunk(
+                        cid,
+                        override.get('source_name', src_mat.name) if override else src_mat.name,
+                        mat_type=1,
+                        diffuse=override.get('diffuse', src_mat.diffuse) if override else src_mat.diffuse,
+                        specular=override.get('specular', src_mat.specular) if override else src_mat.specular,
+                        ambient=src_mat.ambient,
+                        specular_level=src_mat.specular_level,
+                        specular_shininess=src_mat.specular_shininess,
+                        self_illumination=src_mat.self_illumination,
+                        opacity=override.get('opacity', src_mat.opacity) if override else src_mat.opacity,
+                        tex_diffuse=tex_diffuse,
+                        tex_bump=tex_bump,
+                        tex_detail=tex_detail,
+                        flags=src_mat.flags,
+                        alpha_test=src_mat.alpha_test,
+                    )
+                writer.add_chunk(CT_MAT, ver, cid, data)
+                written_ids.add(cid)
+
         for cid, mat in all_standard_mats:
+            if cid in written_ids:
+                continue
             data, ver, _ = build_material_chunk(
-                cid, mat['name'],
+                cid, mat.get('source_name', mat['name']),
                 mat_type=1,
                 diffuse=mat['diffuse'],
                 specular=mat['specular'],
@@ -1226,7 +1407,7 @@ def export_cgf_scene(operator, context, filepath,
 
 # ── CAF export ────────────────────────────────────────────────────────────────
 
-def export_caf(operator, context, filepath, action=None):
+def export_caf(operator, context, filepath, action=None, debug_export=False):
     """Export an animation Action to CAF."""
 
     arm_obj = context.active_object
@@ -1235,11 +1416,22 @@ def export_caf(operator, context, filepath, action=None):
         return {'CANCELLED'}
 
     if action is None:
-        if arm_obj.animation_data and arm_obj.animation_data.action:
-            action = arm_obj.animation_data.action
-        else:
-            operator.report({'ERROR'}, "No action found on armature")
-            return {'CANCELLED'}
+        action = _pick_export_action(arm_obj)
+        if action is None:
+            if getattr(arm_obj, 'animation_data', None) is None:
+                operator.report({'ERROR'}, "No action found on armature")
+                return {'CANCELLED'}
+
+    action = _resolve_action_datablock(action, arm_obj)
+    action_name = None
+    if action is not None:
+        action_name = getattr(action, 'name', None)
+    if not action_name:
+        ad = getattr(arm_obj, 'animation_data', None)
+        if ad is not None and getattr(ad, 'action', None) is not None:
+            action_name = getattr(ad.action, 'name', None)
+    if not action_name:
+        action_name = os.path.splitext(os.path.basename(filepath))[0]
 
     scene = context.scene
     fps = scene.render.fps
@@ -1264,8 +1456,9 @@ def export_caf(operator, context, filepath, action=None):
     writer.add_chunk(CT_SRCINFO, ver, cid, data)
 
     # Timing
-    frame_start = int(action.frame_range[0])
-    frame_end   = int(action.frame_range[1])
+    frame_start, frame_end = _action_frame_range(action, scene)
+    if debug_export:
+        print(f"[CAF-EXPORT-DEBUG] action={action_name} frame_range=({frame_start}, {frame_end})")
     data, ver, cid = build_timing_chunk(
         next_id(), ticks_per_frame, secs_per_tick,
         frame_start * ticks_per_frame,
@@ -1284,8 +1477,9 @@ def export_caf(operator, context, filepath, action=None):
         path_loc = f'pose.bones["{bone_name}"].location'
         path_rot = f'pose.bones["{bone_name}"].rotation_quaternion'
 
-        fc_loc = [action.fcurves.find(path_loc, index=i) for i in range(3)]
-        fc_rot = [action.fcurves.find(path_rot, index=i) for i in range(4)]
+        fcurves = _action_fcurves(action)
+        fc_loc = [fcurves.find(path_loc, index=i) if fcurves else None for i in range(3)]
+        fc_rot = [fcurves.find(path_rot, index=i) if fcurves else None for i in range(4)]
 
         # Collect all keyframe times for this bone
         frame_set = set()
@@ -1295,7 +1489,21 @@ def export_caf(operator, context, filepath, action=None):
                     frame_set.add(int(kp.co[0]))
 
         if not frame_set:
+            if action is None:
+                frame_set = set(range(frame_start, frame_end + 1))
+            elif getattr(arm_obj, 'animation_data', None) is not None:
+                frame_set = set(range(frame_start, frame_end + 1))
+        if not frame_set:
             continue
+
+        if debug_export:
+            loc_counts = [len(fc.keyframe_points) if fc else 0 for fc in fc_loc]
+            rot_counts = [len(fc.keyframe_points) if fc else 0 for fc in fc_rot]
+            print(
+                f"[CAF-EXPORT-DEBUG] bone={bone_name} "
+                f"loc_counts={loc_counts} rot_counts={rot_counts} "
+                f"frame_set_count={len(frame_set)} first={min(frame_set)} last={max(frame_set)}"
+            )
 
         # Sample pose at each keyframe
         keys = []
@@ -1331,7 +1539,7 @@ def export_caf(operator, context, filepath, action=None):
 
     writer.write(filepath)
     print(f"[CGF Export] CAF written: {filepath}")
-    operator.report({'INFO'}, f"Exported action '{action.name}' to {os.path.basename(filepath)}")
+    operator.report({'INFO'}, f"Exported action '{action_name}' to {os.path.basename(filepath)}")
     return {'FINISHED'}
 
 
@@ -1355,20 +1563,14 @@ def export_cal(operator, context, filepath):
 
     for action in bpy.data.actions:
         # Check if this action has curves for bones of this armature
-        has_curves = any(
-            fc.data_path.startswith('pose.bones[')
-            for fc in action.fcurves
-        )
-        if not has_curves:
+        if not _action_has_pose_fcurves(action):
             continue
 
         caf_name = action.name + ".caf"
         caf_path = os.path.join(cal_dir, caf_name)
 
         # Temporarily assign action
-        if arm_obj.animation_data is None:
-            arm_obj.animation_data_create()
-        arm_obj.animation_data.action = action
+        _assign_action_to_armature(arm_obj, action)
 
         result = export_caf(operator, context, caf_path, action=action)
         if result == {'FINISHED'}:
