@@ -402,6 +402,17 @@ class CGFWriter:
         entries.sort(key=lambda x: (x[0], x[1], x[3]))
         return entries
 
+    def _chunk_blob(self, chunk_type, version, chunk_id, data, file_offset):
+        # Far Cry CAF has a mixed layout. The Max-style v827 controller reader
+        # seeks directly to file_offset and reads key data without skipping an
+        # inline chunk header, and SourceInfo behaves the same way.
+        if self.is_anim and (
+            chunk_type == CHUNK_TYPE_SOURCE_INFO or
+            (chunk_type == CHUNK_TYPE_CONTROLLER and version == 0x0827)
+        ):
+            return data
+        return pack_chunk_header(chunk_type, version, file_offset, chunk_id) + data
+
     def write(self, filepath):
         FILE_HEADER_SIZE = 20
 
@@ -409,7 +420,8 @@ class CGFWriter:
         pos = FILE_HEADER_SIZE
         for chunk_type, version, chunk_id, data in self.chunks:
             offsets.append(pos)
-            pos += SIZE_CHUNK_HEADER + len(data)
+            blob = self._chunk_blob(chunk_type, version, chunk_id, data, pos)
+            pos += len(blob)
 
         chunk_table_offset = pos
 
@@ -429,8 +441,7 @@ class CGFWriter:
 
         # Chunks
         for i, (chunk_type, version, chunk_id, data) in enumerate(self.chunks):
-            out += pack_chunk_header(chunk_type, version, offsets[i], chunk_id)
-            out += data
+            out += self._chunk_blob(chunk_type, version, chunk_id, data, offsets[i])
 
         # Chunk table — all normal chunks + embedded chunks
         table_entries = self._build_table_entries(offsets)
