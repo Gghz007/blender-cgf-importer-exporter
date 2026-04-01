@@ -17,8 +17,8 @@ import math
 import os
 import mathutils
 
-from . import cgf_reader
-from .cgf_reader import (CTRL_CRY_BONE, CTRL_LINEAR1, CTRL_LINEAR3, CTRL_LINEAR_Q,
+from . import cry_chunk_reader
+from .cry_chunk_reader import (CTRL_CRY_BONE, CTRL_LINEAR1, CTRL_LINEAR3, CTRL_LINEAR_Q,
                          CTRL_BEZIER1, CTRL_BEZIER3, CTRL_BEZIER_Q,
                          CTRL_TCB1, CTRL_TCB3, CTRL_TCBQ)
 
@@ -221,9 +221,14 @@ def quat_exp_half(rot_log):
     return mathutils.Quaternion((math.cos(half), ax * s, ay * s, az * s))
 
 
-def _v827_local_from_key(key, *, half_rot=True):
-    pos_vec = cry_vec(tuple(float(v) for v in key.pos))
-    quat = quat_exp_half(tuple(float(v) for v in key.rot_log)) if half_rot else quat_exp(tuple(float(v) for v in key.rot_log))
+def _v827_local_from_key(key, *, half_rot=False, bone_name=None):
+    pos_vec = _cry_v827_pos_to_blender((
+        float(key.pos[0]) * INCHES_TO_METERS,
+        float(key.pos[1]) * INCHES_TO_METERS,
+        float(key.pos[2]) * INCHES_TO_METERS,
+    ), bone_name=bone_name)
+    quat_raw = quat_exp_half(tuple(float(v) for v in key.rot_log)) if half_rot else quat_exp(tuple(float(v) for v in key.rot_log))
+    quat = _cry_v827_quat_to_blender(quat_raw)
     return _compose_trs_matrix(
         pos_vec,
         quat,
@@ -275,18 +280,12 @@ def _effective_ctrl_keys(ctrl_chunk):
     if hasattr(keys[0], 'rel_pos'):
         return keys
 
-    first = keys[0]
     trimmed = list(keys)
 
-    # Some v827 clips place the cycle-closing pose as the very first key and
-    # repeat it again at the tail. Old Max CryImporter effectively starts from
-    # the second key and lands on that closing pose at the end, so mirror that
-    # ordering here instead of trimming the visible end pose away.
-    tail_has_first = any(_v827_keys_close(first, k) for k in trimmed[-4:])
-    if tail_has_first and not _v827_keys_close(first, trimmed[1]):
-        trimmed = trimmed[1:]
-
-    # Collapse repeated terminal closing poses but preserve the final timestamp.
+    # Preserve the leading v827 key. Root/root1 were effectively starting from
+    # the second key, which shifted the whole chain and made frame 0 line up
+    # with the next pose instead of the actual first pose from the file.
+    # Only collapse duplicated terminal closing poses.
     while len(trimmed) >= 2 and _v827_keys_close(trimmed[-1], trimmed[-2]):
         trimmed.pop(-2)
     return trimmed
@@ -610,6 +609,23 @@ def _cry_anim_quat_to_blender(quat):
     return mathutils.Quaternion((quat.w, quat.x, -quat.y, -quat.z))
 
 
+def _cry_v827_pos_to_blender(pos, bone_name=None):
+    # v827 CryBone keys do not follow the same axis contract as the generic
+    # rel_pos/rel_quat animation path. For the root/root1 chain, the stable
+    # Max-like local mapping is:
+    #   Max/Cry (x, y, z) -> Blender (-z, y, x)
+    if bone_name == "root1":
+        return mathutils.Vector((pos[0], pos[1], 0.0))
+    return mathutils.Vector((-pos[2], pos[1], pos[0]))
+
+
+def _cry_v827_quat_to_blender(quat):
+    # Keep the v827 position remap, but do not mirror the quaternion through
+    # the generic anim path. For root/root1 the older raw exponential-map
+    # orientation is closer to Max than the fully remapped variant.
+    return quat.copy()
+
+
 def _bone_rest_local_matrix(pbone):
     bone = getattr(pbone, 'bone', None)
     if bone is None:
@@ -845,12 +861,10 @@ def _set_pose_from_anim_pose_matrix(pbone, local_m):
         return
     try:
         rest_local = _bone_rest_local_matrix(pbone)
-        delta = rest_local.inverted_safe() @ local_m
-        d_loc, d_rot, d_scale = delta.decompose()
-        pbone.rotation_mode = 'QUATERNION'
-        pbone.location = d_loc
-        pbone.rotation_quaternion = d_rot
-        pbone.scale = d_scale
+        # Keep the Max-style local PRS contract as a single local basis delta.
+        # Decomposing through Blender's location/rotation/scale path is what
+        # tends to split root/root1 even when the bind matrices already match.
+        pbone.matrix_basis = rest_local.inverted_safe() @ local_m
         return
     except Exception:
         pass
@@ -1135,16 +1149,16 @@ def _evaluate_v827_hybrid_at_time(bone_name, ctrl_chunk, time_tick, bind_local):
     return _compose_trs_matrix(loc, rot, scl)
 
 
-def _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, *, half_rot=False):
+def _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, *, half_rot=False, bone_name=None):
     keys = _effective_ctrl_keys(ctrl_chunk)
     if not keys:
         return mathutils.Matrix.Identity(4)
     if len(keys) == 1:
-        return _v827_local_from_key(keys[0], half_rot=half_rot)
+        return _v827_local_from_key(keys[0], half_rot=half_rot, bone_name=bone_name)
     if time_tick <= keys[0].time:
-        return _v827_local_from_key(keys[0], half_rot=half_rot)
+        return _v827_local_from_key(keys[0], half_rot=half_rot, bone_name=bone_name)
     if time_tick >= keys[-1].time:
-        return _v827_local_from_key(keys[-1], half_rot=half_rot)
+        return _v827_local_from_key(keys[-1], half_rot=half_rot, bone_name=bone_name)
 
     prev_key = keys[0]
     next_key = keys[-1]
@@ -1154,8 +1168,8 @@ def _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, *, half_rot=False):
             next_key = keys[idx]
             break
 
-    prev_m = _v827_local_from_key(prev_key, half_rot=half_rot)
-    next_m = _v827_local_from_key(next_key, half_rot=half_rot)
+    prev_m = _v827_local_from_key(prev_key, half_rot=half_rot, bone_name=bone_name)
+    next_m = _v827_local_from_key(next_key, half_rot=half_rot, bone_name=bone_name)
     if prev_key.time == next_key.time:
         return prev_m
 
@@ -1221,7 +1235,9 @@ def _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick):
             keys = getattr(ctrl_chunk, 'keys', None) or []
             is_v827 = bool(keys) and not hasattr(keys[0], 'rel_pos')
             if is_v827 and bone_name.lower() in V827_ABSOLUTE_BONES:
-                local_m = _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, half_rot=False)
+                local_m = _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, half_rot=False, bone_name=bone_name)
+            elif is_v827:
+                local_m = _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, half_rot=False, bone_name=bone_name)
             else:
                 local_m = _evaluate_crybone_controller_at_time(
                     ctrl_chunk, time_tick, default_local=default_local
@@ -1250,24 +1266,17 @@ def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame
     _reset_pose_bones_to_rest(arm_obj, bone_names)
     bind_pose = None
     cry_pose = None
-    bind_pose_raw = None
-    cry_pose_raw = None
     geom_archive = getattr(arm_obj, "_cry_geom_archive_ref", None)
     if geom_archive is not None:
         try:
             bind_pose = _build_cry_bind_pose(geom_archive, arm_obj=arm_obj)
             if bind_pose:
                 cry_pose = _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick)
-            bind_pose_raw = _build_cry_bind_pose_raw(geom_archive)
-            if bind_pose_raw:
-                cry_pose_raw = _evaluate_cry_skeleton_pose_raw(bind_pose_raw, ctrl_by_bone, time_tick)
         except Exception:
             bind_pose = None
             cry_pose = None
-            bind_pose_raw = None
-            cry_pose_raw = None
     ordered_bone_names = bone_names
-    active_pose = cry_pose_raw if cry_pose_raw else cry_pose
+    active_pose = cry_pose
     if active_pose:
         ordered_bone_names = [name for name, _ in sorted(
             active_pose.items(), key=lambda kv: kv[1]["bone_id"]
@@ -1280,12 +1289,9 @@ def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame
         if pbone is None:
             continue
         ctrl_chunk = ctrl_by_bone[bone_name]
-        if cry_pose_raw and bone_name in cry_pose_raw:
-            local_m = None
-            world_m = arm_obj.matrix_world.inverted_safe() @ _raw_max_matrix_to_blender(cry_pose_raw[bone_name]["world"])
-        elif cry_pose and bone_name in cry_pose:
+        if cry_pose and bone_name in cry_pose:
             local_m = cry_pose[bone_name]["local"].copy()
-            world_m = cry_pose[bone_name]["world"].copy()
+            world_m = None
         else:
             local_m = _evaluate_crybone_controller_at_time(
                 ctrl_chunk, time_tick, default_local=_bone_rest_local_matrix(pbone)
@@ -1294,8 +1300,7 @@ def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame
         if world_m is not None:
             _set_pose_from_world_matrix(pbone, world_m)
         else:
-            loc, rot, scl = local_m.decompose()
-            _set_pose_from_anim_local(pbone, loc, rot, scl)
+            _set_pose_from_anim_pose_matrix(pbone, local_m)
 
     try:
         bpy.context.view_layer.update()
@@ -1345,11 +1350,8 @@ def _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame):
 
 
 def _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame):
-    focus = {"root1", "weapon", "reload"}
     print(f"[CAF-MATRIX] frame={frame:.3f} tick={time_tick}")
     for bone_name in ("root1", "weapon", "reload"):
-        if bone_name not in focus:
-            continue
         pbone = arm_obj.pose.bones.get(bone_name)
         ctrl_chunk = ctrl_by_bone.get(bone_name)
         if pbone is None or ctrl_chunk is None:
@@ -1376,6 +1378,54 @@ def _debug_log_cry_pose(bind_pose, ctrl_by_bone, time_tick, frame):
         print(f"[CRYPOSE] bone={bone_name} bind_local={_fmt_matrix4(item['bind_local'])}")
         print(f"[CRYPOSE] bone={bone_name} anim_local={_fmt_matrix4(item['local'])}")
         print(f"[CRYPOSE] bone={bone_name} anim_world={_fmt_matrix4(item['world'])}")
+
+
+def _debug_log_v827_root_keys(ctrl_by_bone, time_tick, frame):
+    print(f"[V827-ROOT] frame={frame:.3f} tick={time_tick}")
+    for bone_name in ("root", "root1"):
+        ctrl_chunk = ctrl_by_bone.get(bone_name)
+        if ctrl_chunk is None:
+            continue
+        keys = _effective_ctrl_keys(ctrl_chunk)
+        if not keys or hasattr(keys[0], 'rel_pos'):
+            continue
+
+        prev_key = keys[0]
+        next_key = keys[-1]
+        alpha = 0.0
+        if len(keys) > 1:
+            if time_tick <= keys[0].time:
+                prev_key = next_key = keys[0]
+            elif time_tick >= keys[-1].time:
+                prev_key = next_key = keys[-1]
+            else:
+                for idx in range(1, len(keys)):
+                    if time_tick <= keys[idx].time:
+                        prev_key = keys[idx - 1]
+                        next_key = keys[idx]
+                        break
+                if next_key.time != prev_key.time:
+                    alpha = (time_tick - prev_key.time) / (next_key.time - prev_key.time)
+
+        def _vec3(v):
+            return f"({float(v[0]):.4f},{float(v[1]):.4f},{float(v[2]):.4f})"
+
+        print(
+            f"[V827-ROOT] bone={bone_name} "
+            f"prev_time={int(prev_key.time)} next_time={int(next_key.time)} alpha={float(alpha):.4f}"
+        )
+        print(
+            f"[V827-ROOT] bone={bone_name} "
+            f"prev_pos_raw={_vec3(prev_key.pos)} next_pos_raw={_vec3(next_key.pos)}"
+        )
+        print(
+            f"[V827-ROOT] bone={bone_name} "
+            f"prev_rotlog={_vec3(prev_key.rot_log)} next_rotlog={_vec3(next_key.rot_log)}"
+        )
+        prev_local = _v827_local_from_key(prev_key, half_rot=False, bone_name=bone_name)
+        next_local = _v827_local_from_key(next_key, half_rot=False, bone_name=bone_name)
+        print(f"[V827-ROOT] bone={bone_name} prev_local={_fmt_matrix4(prev_local)}")
+        print(f"[V827-ROOT] bone={bone_name} next_local={_fmt_matrix4(next_local)}")
 
 
 def _debug_log_bone_space_deltas(arm_obj, bind_pose):
@@ -2070,6 +2120,7 @@ def _apply_crybone_controllers(
             _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame)
         if debug_caf and (idx == 0 or idx == mid_index or idx == last_index or (target_tick is not None and int(time_tick) == int(target_tick))):
             _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame)
+            _debug_log_v827_root_keys(ctrl_by_bone, time_tick, frame)
             if bind_pose:
                 _debug_log_cry_pose(bind_pose, ctrl_by_bone, time_tick, frame)
                 debug_cry_pose = _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick)
@@ -2694,22 +2745,10 @@ def build_armature(archive, collection, asset_root_obj=None, apply_asset_transfo
     arm_obj  = bpy.data.objects.new("Armature", arm_data)
     collection.objects.link(arm_obj)
 
-    # BoneInitialPos belongs to a specific mesh chunk/object. Keep the armature in the
-    # same object space as that mesh node, otherwise bones appear offset from the mesh
-    # even before any animation is applied.
-    armature_node = None
-    if archive.bone_initial_pos_chunks:
-        target_object_id = archive.bone_initial_pos_chunks[0].mesh_chunk_id
-        armature_node = next((n for n in archive.node_chunks if n.object_id == target_object_id), None)
-    if armature_node is None:
-        armature_node = next((n for n in archive.node_chunks if n.object_id >= 0), None)
-    if apply_asset_transform and asset_root_obj is not None:
-        _parent_object_under_root(arm_obj, asset_root_obj, asset_root_obj.matrix_world.copy())
-    elif apply_asset_transform and armature_node and armature_node.trans_matrix:
-        try:
-            arm_obj.matrix_world = cry_matrix_to_blender(armature_node.trans_matrix)
-        except Exception as e:
-            print(f"[CGF] Armature node transform error {armature_node.name}: {e}")
+    # Keep the armature object neutral. BoneInitialPos already contains the bind
+    # placement; adding armature object-space here splits root/root1 away from the
+    # scene pivots seen in Max.
+    arm_obj.matrix_world = mathutils.Matrix.Identity(4)
 
     # Make active and enter edit mode
     bpy.context.view_layer.objects.active = arm_obj
@@ -2736,14 +2775,12 @@ def build_armature(archive, collection, asset_root_obj=None, apply_asset_transfo
         bpy.ops.object.mode_set(mode='EDIT')
 
     bones = archive.bone_anim_chunks[0].bones
-    armature_world = arm_obj.matrix_world.copy()
-    armature_world_inv = armature_world.inverted_safe()
     init_mats = {}
     child_map = {}
     for bone in bones:
         init = archive.get_bone_initial_pos(bone.bone_id)
         if init:
-            init_mats[bone.bone_id] = armature_world_inv @ cry_bone_matrix43_to_blender(init)
+            init_mats[bone.bone_id] = cry_bone_matrix43_to_blender(init)
         child_map.setdefault(bone.parent_id, []).append(bone.bone_id)
 
     eb_map = {}
@@ -3058,7 +3095,7 @@ def _apply_controller_to_bone(pbone, ctrl_chunk, action, ticks_per_frame, bone_n
     bone_path_scl  = f'pose.bones["{bone_name}"].scale'
     pbone.rotation_mode = 'QUATERNION'
 
-    from .cgf_reader import (CTRL_CRY_BONE, CTRL_LINEAR3, CTRL_LINEAR_Q,
+    from .cry_chunk_reader import (CTRL_CRY_BONE, CTRL_LINEAR3, CTRL_LINEAR_Q,
                               CTRL_BEZIER3, CTRL_BEZIER_Q,
                               CTRL_TCB3, CTRL_TCBQ)
 
@@ -3236,7 +3273,7 @@ def load(operator, context, filepath,
 
     print(f"[CGF] Loading: {filepath}")
     print(f"[CGF] Game root: '{game_root_path}'")
-    reader = cgf_reader.ChunkReader()
+    reader = cry_chunk_reader.ChunkReader()
     try:
         print(f"[CGF] Reading file...")
         archive = reader.read_file(filepath)
@@ -3364,7 +3401,7 @@ def _ensure_armature(operator, context, anim_filepath):
         return None, None
 
     print(f"[CGF] Auto-importing geometry: {cgf_path}")
-    reader = cgf_reader.ChunkReader()
+    reader = cry_chunk_reader.ChunkReader()
     try:
         archive = reader.read_file(cgf_path)
     except ValueError as e:
@@ -3478,7 +3515,7 @@ def load_caf(operator, context, filepath, append=True, debug_caf=False):
         geom_archive = _build_geom_archive_from_armature(arm_obj)
 
     print(f"[CGF] Loading animation: {filepath}")
-    reader = cgf_reader.ChunkReader()
+    reader = cry_chunk_reader.ChunkReader()
     try:
         anim_archive = reader.read_file(filepath)
     except ValueError as e:
@@ -3509,7 +3546,7 @@ def load_cal(operator, context, filepath, debug_caf=False):
     else:
         geom_archive = _build_geom_archive_from_armature(arm_obj)
 
-    records = cgf_reader.read_cal_file(filepath)
+    records = cry_chunk_reader.read_cal_file(filepath)
     if not records:
         operator.report({'WARNING'}, "CAL file is empty or could not be parsed")
         return {'CANCELLED'}
@@ -3520,7 +3557,7 @@ def load_cal(operator, context, filepath, debug_caf=False):
                                   arm_obj.get('cgf_source_path', ''))
         if not caf_path:
             print(f"[CGF] CAF not found: {rec.path}"); continue
-        reader = cgf_reader.ChunkReader()
+        reader = cry_chunk_reader.ChunkReader()
         try:
             anim_archive = reader.read_file(caf_path)
         except Exception as e:
@@ -3544,14 +3581,14 @@ def _build_geom_archive_from_armature(arm_obj):
     Bone ctrl_ids are stored as custom properties on pose bones.
     Falls back to re-reading the source CGF if pose data is unavailable.
     """
-    archive = cgf_reader.CryChunkArchive()
+    archive = cry_chunk_reader.CryChunkArchive()
     archive.geom_file_name = arm_obj.get('cgf_source_path', '')
 
     # Try to reload from source CGF first — most reliable
     source_path = arm_obj.get('cgf_source_path', '')
     if source_path and os.path.isfile(source_path):
         try:
-            reader = cgf_reader.ChunkReader()
+            reader = cry_chunk_reader.ChunkReader()
             src = reader.read_file(source_path)
             archive.bone_anim_chunks      = src.bone_anim_chunks
             archive.bone_name_list_chunks = src.bone_name_list_chunks
@@ -3563,14 +3600,14 @@ def _build_geom_archive_from_armature(arm_obj):
             print(f"[CGF] Could not reload source CGF: {e}")
 
     # Fallback: build from pose bones + stored ctrl_ids
-    bac  = cgf_reader.CryBoneAnimChunk()
-    bac.header  = cgf_reader.ChunkHeader()
-    bnlc = cgf_reader.CryBoneNameListChunk()
-    bnlc.header = cgf_reader.ChunkHeader()
+    bac  = cry_chunk_reader.CryBoneAnimChunk()
+    bac.header  = cry_chunk_reader.ChunkHeader()
+    bnlc = cry_chunk_reader.CryBoneNameListChunk()
+    bnlc.header = cry_chunk_reader.ChunkHeader()
 
     pose_bones = arm_obj.pose.bones if arm_obj.pose else []
     for i, pbone in enumerate(pose_bones):
-        bone = cgf_reader.CryBone()
+        bone = cry_chunk_reader.CryBone()
         bone.bone_id = i
         bone.name    = pbone.name
         bone.ctrl_id = pbone.get('cry_ctrl_id', 'FFFFFFFF')
