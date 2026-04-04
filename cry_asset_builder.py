@@ -3415,13 +3415,14 @@ def _ensure_armature(operator, context, anim_filepath):
     context.scene.collection.children.link(collection)
     prefs = bpy.context.preferences.addons.get('io_import_cgf')
     pref_obj = prefs.preferences if prefs else None
-    create_asset_root_empty = bool(getattr(pref_obj, "create_asset_root_empty", True))
-    apply_armature_node_transform = bool(getattr(pref_obj, "apply_armature_node_transform", True))
-    apply_mesh_node_transform = bool(getattr(pref_obj, "apply_mesh_node_transform", True))
-    preserve_mesh_world_on_armature_parent = bool(getattr(pref_obj, "preserve_mesh_world_on_armature_parent", True))
-    create_helper_nodes = bool(getattr(pref_obj, "create_helper_nodes", True))
-    create_controller_targets = bool(getattr(pref_obj, "create_controller_targets", True))
-    create_producer_cameras = bool(getattr(pref_obj, "create_producer_cameras", True))
+    full_scene_setup = bool(getattr(pref_obj, "enable_scene_setup", True))
+    create_asset_root_empty = full_scene_setup
+    apply_armature_node_transform = True
+    apply_mesh_node_transform = True
+    preserve_mesh_world_on_armature_parent = True
+    create_helper_nodes = full_scene_setup
+    create_controller_targets = full_scene_setup
+    create_producer_cameras = full_scene_setup
 
     asset_root_obj = None
     if create_asset_root_empty:
