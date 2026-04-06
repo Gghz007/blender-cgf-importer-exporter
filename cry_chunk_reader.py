@@ -759,15 +759,43 @@ class ChunkReader:
         is_anim=(file_type_high==FILE_TYPE_ANIM_HIGH and file_type_low==FILE_TYPE_ANIM_LOW)
         if not (is_geom or is_anim):
             raise ValueError(f"Unknown file type 0x{file_type_high:04X}:0x{file_type_low:04X}")
+        archive=CryChunkArchive()
+        archive.geom_file_name=filepath if is_geom else ""
         self._seek(16); chunk_table_pos=self._read_u32()
+
+        # Some older/variant CE1 geometry files store chunks sequentially and
+        # use 0xFFFFFFFF in the nominal chunk-table slot instead of a real table
+        # pointer. Fall back to streaming chunk reads from offset 20 in that
+        # case instead of treating the sentinel as a huge offset and crashing.
+        if chunk_table_pos == 0xFFFFFFFF or chunk_table_pos < 20 or chunk_table_pos >= len(self.data):
+            print(f"[CGF] chunk table pointer invalid (0x{chunk_table_pos:08X}); using sequential chunk scan")
+            pos = 20
+            index = 0
+            while pos + SIZE_CHUNK_HEADER <= len(self.data):
+                self._seek(pos)
+                h = self._read_chunk_header()
+                if h.file_offset != pos:
+                    if h.file_offset < 20 or h.file_offset >= len(self.data):
+                        break
+                    pos = h.file_offset
+                    continue
+                print(f"[CGF] chunk {index}/? type=0x{h.type:04X} ver=0x{h.version:04X} offset={h.file_offset}")
+                chunk = self._read_chunk(h, len(self.data))
+                if chunk is not None:
+                    archive.add(chunk)
+                next_pos = self._tell()
+                if next_pos <= pos:
+                    break
+                pos = next_pos
+                index += 1
+            return archive
+
         self._seek(chunk_table_pos); num_chunks=self._read_u32(); hstart=self._tell()
         headers=[]
         for i in range(num_chunks):
             self._seek(hstart+i*SIZE_CHUNK_HEADER)
             headers.append(self._read_chunk_header())
         headers.sort(key=lambda h: (h.file_offset, h.type, h.chunk_id))
-        archive=CryChunkArchive()
-        archive.geom_file_name=filepath if is_geom else ""
         for i,h in enumerate(headers):
             next_pos=headers[i+1].file_offset if i+1<num_chunks else chunk_table_pos
             print(f"[CGF] chunk {i}/{num_chunks} type=0x{h.type:04X} ver=0x{h.version:04X} offset={h.file_offset}")
