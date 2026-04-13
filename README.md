@@ -251,6 +251,12 @@ The addon currently exposes multiple animation playback/application modes. These
 
 This split was useful because the project reached a state where bind/rest alignment and deformation checks became nearly exact, while the visible animation result could still be wrong. That points at controller evaluation / pose application rather than mesh skinning itself.
 
+### Current Note (Post v243+)
+
+- the experimental Blender-only verification path was removed from the normal UI flow
+- `Armature Keys` is back on a minimal delta bridge path (`bind^-1 * anim_local` applied through pose basis)
+- this keeps the importer on a more deterministic path while evaluator-space fixes continue
+
 ## Export Workflows
 
 ### Export CGF
